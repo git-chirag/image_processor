@@ -1,0 +1,6 @@
+pipenv install fastapi uvicorn redis celery boto3 pillow python-dotenv
+uvicorn app.main:app --reload
+
+
+
+celery -A app.celery_worker.celery worker --loglevel=info --concurrency=1 --pool=solo
