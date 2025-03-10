@@ -3,8 +3,6 @@ from dotenv import load_dotenv
 import boto3
 import redis
 import time
-import cloudinary
-import cloudinary.uploader
 
 def get_redis_client(retries=5, delay=2):
     for attempt in range(retries):

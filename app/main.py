@@ -18,11 +18,11 @@ def validate_csv(file_content: str):
         raise HTTPException(status_code=400, detail="CSV file is empty or missing data.")
 
     # Validate header
-    expected_headers = ["sr no.", "product name"]
-    print(csv_data[0][:2])
-    if not all(header.lower() in csv_data[0][:2] for header in expected_headers):
-        raise HTTPException(status_code=400, detail="Invalid CSV headers. Expected: 'sr no.', 'product name', and 'image urls'.")
-
+    expected_headers = ["Sr. No", "Product Name", "Input Image URLs"]
+    csv_headers = [header.strip() for header in csv_data[0][:3]]
+    if not all(header in csv_headers for header in expected_headers):
+        raise HTTPException(status_code=400, detail="Invalid CSV headers. Expected: 'Sr. No', 'Product Name', and 'Input Image URLs'.")
+    
     total_rows = len(csv_data) - 1  # Exclude header row
     if total_rows > MAX_ROWS:
         raise HTTPException(status_code=400, detail=f"CSV exceeds maximum allowed rows ({MAX_ROWS}).")
