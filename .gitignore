@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 *.pyo
 app/commands.txt
+app/commands.txt

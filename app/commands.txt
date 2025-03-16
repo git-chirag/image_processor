@@ -1,3 +1,15 @@
 pipenv install fastapi uvicorn redis celery boto3 pillow python-dotenv
 uvicorn app.main:app --reload
 celery -A app.celery_worker.celery worker --loglevel=info --concurrency=1 --pool=solo
+
+
+
+aws ecs run-task --cluster image-processor-cluster --task-definition celery-worker-task --overrides '{"containerOverrides": [{"name": "celery-worker", "command": ["celery", "-A", "app.celery_worker.celery", "worker", "--loglevel=info"]}]}' --network-configuration awsvpcConfiguration={subnets=["subnet-06ee48e89a387fa30"],securityGroups=["sg-06e82e27e8ad5889c"],assignPublicIp="ENABLED"}
+Amazon Elastic Container Service
+Task definitions
+celery-worker-task
+Revision 3
+Create revision
+
+//command override for container - celery 
+>aws ecs run-task --cluster image-processor-cluster --task-definition celery-worker-task --launch-type FARGATE --overrides "{\"containerOverrides\": [{\"name\": \"celery-worker\", \"command\": [\"celery\", \"-A\", \"app.celery_worker.celery\", \"worker\", \"--loglevel=info\"]}]}" --network-configuration "{\"awsvpcConfiguration\": {\"subnets\": [\"subnet-06ee48e89a387fa30\"], \"securityGroups\": [\"sg-06e82e27e8ad5889c\"], \"assignPublicIp\": \"ENABLED\"}}"

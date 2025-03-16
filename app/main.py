@@ -4,10 +4,10 @@ from fastapi.responses import StreamingResponse
 from app.tasks import process_csv
 from app.config import redis_client, s3_client, AWS_BUCKET_NAME
 import re
+import requests
 
 MAX_ROWS = 1000  # Maximum number of rows allowed in CSV
 MAX_IMAGES_PER_ROW = 10  # Maximum number of image URLs allowed per row
-ALLOWED_IMAGE_FORMATS = {".jpg", ".jpeg", ".png"}  # Allowed image formats
 
 def validate_csv(file_content: str):
     """Validates CSV content before processing. Raises HTTPException on failure."""
@@ -70,7 +70,7 @@ async def upload_csv(file: UploadFile = File(...), webhook_url: str = Form(None)
     try:
         validate_csv(content.decode("utf-8"))
     except HTTPException as e:
-        return {"error": e.detail} 
+        return {"Validation Error": e.detail} 
 
     print("outside validate_csv")
     request_id = str(uuid.uuid4()) #create a unique id for the request
@@ -109,13 +109,22 @@ def get_status(request_id: str):
         "csv_url": csv_url if status == "csv_ready" else None
     }
 
-#TODO: change to older version where streamingresponse was sent
 @app.get("/download/{request_id}")
 def download_csv(request_id: str):
+    """Fetch the CSV file from S3 and return it as a streaming response."""
+    
     csv_url = redis_client.get(f"request:{request_id}:csv_url")
 
     if not csv_url:
         return {"error": "CSV file not found or processing not completed yet."}
 
-    return {"request_id": request_id, "csv_url": csv_url}
+    # Fetch the CSV file from S3
+    response = requests.get(csv_url, stream=True)
+    
+    if response.status_code != 200:
+        return {"error": "Failed to fetch CSV file from S3."}
+
+    return StreamingResponse(response.iter_content(chunk_size=1024), 
+                             media_type="text/csv",
+                             headers={"Content-Disposition": f"attachment; filename={request_id}.csv"})
    

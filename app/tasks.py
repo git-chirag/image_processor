@@ -1,7 +1,7 @@
 import io
 import botocore.exceptions
+from celery import chain
 import requests
-from PIL import Image
 from app.celery_worker import celery
 from app.config import s3_client, AWS_BUCKET_NAME, AWS_REGION, redis_client, CLOUDINARY_FETCH_URL
 import csv
@@ -60,73 +60,6 @@ def get_compressed_url(image_url):
     """Generate Cloudinary fetch URL for compression."""
     return f"{CLOUDINARY_FETCH_URL}/q_50,f_auto/{image_url}?_={int(time.time())}"
 
-
-@celery.task(name="compress_image", autoretry_for=(requests.exceptions.RequestException, IOError),
-             retry_kwargs={"max_retries": 3, "countdown": 5})
-def compress_image(request_id, row_number, image_url, image_index):
-    """Download, compress, and return processed image data."""
-    try:
-        cloudinary_compressed_url = get_compressed_url(image_url)
-
-
-        # Download the compressed image from Cloudinary
-        response = requests.get(cloudinary_compressed_url, stream=True, timeout=10)
-        response.raise_for_status()
-
-        # Convert response to file-like object for S3 upload
-        img_bytes = io.BytesIO(response.content)
-
-
-        # Upload compressed image to S3
-        s3_filename = f"{request_id}/{row_number}_{image_index}.jpg"
-        s3_client.upload_fileobj(img_bytes, AWS_BUCKET_NAME, s3_filename, ExtraArgs={'ContentType': 'image/jpeg'})
-        compressed_url = f"https://{AWS_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{s3_filename}"
-
-    except (requests.exceptions.RequestException, botocore.exceptions.ClientError, ValueError) as e:
-        print(f"Error processing image {image_url}: {e}")
-        return f"Failed to process {image_url}"
-    
-
-    # Store the processed image URL in Redis
-    # redis_client.rpush(f"request:{request_id}:row:{row_number}:processed_urls", compressed_url)
-    redis_client.hset(f"request:{request_id}:row:{row_number}", f"processed_image_{image_index}", compressed_url)
-
-
-    # Check if all images for this row are processed
-    total_images = redis_client.llen(f"request:{request_id}:row:{row_number}:image_urls")
-    processed_images = redis_client.llen(f"request:{request_id}:row:{row_number}:processed_urls")
-
-    if processed_images == total_images:
-        row_processed_key = f"request:{request_id}:row:{row_number}:processed"
-
-        if not redis_client.exists(row_processed_key): 
-            redis_client.incr(f"request:{request_id}:processed_rows")  
-            redis_client.set(row_processed_key, "true") 
-
-        # Check if all rows are processed
-        total_rows = int(redis_client.get(f"request:{request_id}:total_rows") or 0)
-        processed_rows = int(redis_client.get(f"request:{request_id}:processed_rows") or 0)
-
-        if processed_rows == total_rows:
-            redis_client.set(f"request:{request_id}:status", "completed")  # Mark CSV as completed
-            generate_output_csv.delay(request_id)
-            webhook_url = redis_client.get(f"request:{request_id}:webhook_url")
-            if webhook_url: #should happen after the output csv has been generated
-                payload = {
-                    "request_id": request_id,
-                    "status": "completed",
-                    "total_rows": total_rows,
-                    "message": "CSV processing completed successfully."
-                }
-                try:
-                    requests.post(webhook_url, json=payload, timeout=10)
-                    response.raise_for_status()
-                except requests.exceptions.RequestException as e:
-                    print(f"Webhook request failed for {webhook_url}: {e}")
-
-    return {"compressed_url": compressed_url}
-
-
 @celery.task(name="generate_output_csv")
 def generate_output_csv(request_id):
     """Generate the output CSV and store it in S3."""
@@ -158,7 +91,7 @@ def generate_output_csv(request_id):
                 compressed_urls.append(compressed_url)
 
         csv_writer.writerow([sr_no, product_name, ",".join(original_urls), ",".join(compressed_urls)])
-
+        
     # Upload CSV to S3
     output.seek(0)
     s3_filename = f"processed_csv/{request_id}.csv"
@@ -172,9 +105,90 @@ def generate_output_csv(request_id):
         # Update status to csv_ready **only after successful upload**
         redis_client.set(f"request:{request_id}:status", "csv_ready")
 
-        return {"csv_url": csv_url}
+        return request_id
 
     except Exception as e:
         print(f"Error uploading CSV to S3: {e}")
         redis_client.set(f"request:{request_id}:status", "csv_upload_failed")  # New status for failed upload
         return {"error": "Failed to upload CSV"}
+    
+@celery.task(name="send_webhook_notification")
+def send_webhook_notification(request_id, total_rows):
+    """ Send webhook notification after CSV generation is complete """
+    webhook_url = redis_client.get(f"request:{request_id}:webhook_url")
+    if webhook_url:
+        payload = {
+            "request_id": request_id,
+            "status": "csv_ready",
+            "total_rows": total_rows,
+            "message": "CSV processing completed successfully.",
+        }
+        try:
+            response = requests.post(webhook_url, json=payload, timeout=10)
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            print(f"Webhook request failed for {webhook_url}: {e}")
+
+@celery.task(name="check_csv_completion", max_retries=5, default_retry_delay=10)
+def check_csv_completion(request_id, row_number):
+    """Check if all images and rows are processed, then trigger CSV generation and webhook notification."""
+    
+    # Get total images in the row
+    total_images = int(redis_client.hget(f"request:{request_id}:row:{row_number}", "image_count") or 0)
+    
+    # Count how many images have been processed
+    processed_images = int(redis_client.hget(f"request:{request_id}:row:{row_number}", "processed_image_count") or 0)
+
+    if processed_images == total_images:
+        row_processed_key = f"request:{request_id}:row:{row_number}:processed"
+        if not redis_client.exists(row_processed_key):
+            redis_client.incr(f"request:{request_id}:processed_rows")
+            redis_client.set(row_processed_key, "true")  # Mark this row as processed
+    
+    total_rows = int(redis_client.get(f"request:{request_id}:total_rows") or 0)
+    processed_rows = int(redis_client.get(f"request:{request_id}:processed_rows") or 0)
+
+    if processed_rows == total_rows:
+        redis_client.set(f"request:{request_id}:status", "completed")  # Mark CSV as completed
+
+        try:
+            chain(generate_output_csv.s(request_id), send_webhook_notification.s(total_rows)).apply_async()
+        except check_csv_completion.max_retries:  
+            redis_client.set(f"request:{request_id}:status", "failed")
+            print(f"CSV processing failed after max retries for request {request_id}")
+
+
+@celery.task(name="compress_image", autoretry_for=(requests.exceptions.RequestException, IOError, botocore.exceptions.ClientError),
+             retry_kwargs={"max_retries": 3, "countdown": 5}, retry_backoff=True)
+def compress_image(request_id, row_number, image_url, image_index):
+    """Download, compress, and return processed image data."""
+    try:
+        cloudinary_compressed_url = get_compressed_url(image_url)
+
+
+        # Download the compressed image from Cloudinary
+        response = requests.get(cloudinary_compressed_url, stream=True, timeout=10)
+        response.raise_for_status()
+
+        # Convert response to file-like object for S3 upload
+        img_bytes = io.BytesIO(response.content)
+
+
+        # Upload compressed image to S3
+        s3_filename = f"{request_id}/{row_number}_{image_index}.jpg"
+        s3_client.upload_fileobj(img_bytes, AWS_BUCKET_NAME, s3_filename, ExtraArgs={'ContentType': 'image/jpeg'})
+        compressed_url = f"https://{AWS_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{s3_filename}"
+
+    except (requests.exceptions.RequestException, botocore.exceptions.ClientError, ValueError) as e:
+        print(f"Error processing image {image_url}: {e}")
+        compress_image.retry(exc=e, countdown=5)
+
+    
+
+    # Store the processed image URL in Redis
+    # redis_client.rpush(f"request:{request_id}:row:{row_number}:processed_urls", compressed_url)
+    redis_client.hset(f"request:{request_id}:row:{row_number}", f"processed_image_{image_index}", compressed_url)
+    redis_client.hincrby(f"request:{request_id}:row:{row_number}", "processed_image_count", 1)
+
+    check_csv_completion.apply_async((request_id, row_number))
+    return {"compressed_url": compressed_url}
