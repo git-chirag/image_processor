@@ -3,7 +3,12 @@ from app.config import REDIS_URL
 
 celery = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL, include=["app.tasks"])
 
-celery.conf.update(task_track_started=True)
+celery.conf.update(
+    task_track_started=True,
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    broker_connection_retry_on_startup=True,
+)
 
 # Ensure Celery does not crash on Redis disconnection
 celery.conf.broker_transport_options = {

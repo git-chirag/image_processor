@@ -1,10 +1,12 @@
-from fastapi import FastAPI, Form, UploadFile, File, HTTPException
 import uuid
+
+import botocore.exceptions
+from fastapi import FastAPI, Form, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
+
 from app.tasks import process_csv
 from app.config import redis_client, s3_client, AWS_BUCKET_NAME
 from app.validation import validate_csv
-import requests
 
 app = FastAPI()
 
@@ -22,58 +24,91 @@ async def upload_csv(file: UploadFile = File(...), webhook_url: str = Form(None)
     # Validation errors propagate so FastAPI returns the intended HTTP 400.
     validate_csv(decoded_content)
 
-    print("outside validate_csv")
-    request_id = str(uuid.uuid4()) #create a unique id for the request
-    redis_client.set(f"request:{request_id}:status", "processing") #store status are processing for the id in redis
-    if webhook_url:
-        redis_client.set(f"request:{request_id}:webhook_url", webhook_url)#store webhook url for the id in redis
-
+    request_id = str(uuid.uuid4())
     file.file.seek(0)
 
-    # Upload CSV to S3
-    s3_filename = f"{request_id}/csv_uploads/{request_id}.csv"
-    s3_client.upload_fileobj(file.file, AWS_BUCKET_NAME, s3_filename,  ExtraArgs={'ContentType': 'text/csv'})#upload inupt file to S3
+    input_csv_key = f"{request_id}/csv_uploads/{request_id}.csv"
+    try:
+        s3_client.upload_fileobj(
+            file.file,
+            AWS_BUCKET_NAME,
+            input_csv_key,
+            ExtraArgs={"ContentType": "text/csv"},
+        )
+    except (botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to store the CSV for processing.",
+        ) from exc
 
-    # Store the S3 file URL in Redis instead of full CSV data
-    file_url = f"https://{AWS_BUCKET_NAME}.s3.amazonaws.com/{s3_filename}"
-    redis_client.set(f"request:{request_id}:csv_url", file_url)#store input file url's S3 location in redis
+    redis_client.set(f"request:{request_id}:status", "processing")
+    redis_client.set(f"request:{request_id}:input_csv_key", input_csv_key)
+    if webhook_url:
+        redis_client.set(f"request:{request_id}:webhook_url", webhook_url)
+        redis_client.set(f"request:{request_id}:webhook_status", "pending")
 
-    process_csv.delay(request_id)#asyncly process the file
+    process_csv.delay(request_id)
 
     return {"request_id": request_id, "status": "processing"}
 
 @app.get("/status/{request_id}")
 def get_status(request_id: str):
     """Check processing status of a CSV file."""
-    status = redis_client.get(f"request:{request_id}:status") or "unknown"
+    status = redis_client.get(f"request:{request_id}:status")
+    if status is None:
+        raise HTTPException(status_code=404, detail="Request not found.")
+
     processed_rows = int(redis_client.get(f"request:{request_id}:processed_rows") or 0)
-    total_rows = int(redis_client.get(f"request:{request_id}:total_rows") or 1)  # Avoid division by zero
-    csv_url = redis_client.get(f"request:{request_id}:csv_url")
+    total_rows = int(redis_client.get(f"request:{request_id}:total_rows") or 0)
+    progress = (processed_rows / total_rows) * 100 if total_rows else 0
+
+    csv_url = None
+    output_csv_key = redis_client.get(f"request:{request_id}:output_csv_key")
+    if status == "csv_ready" and output_csv_key:
+        csv_url = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": AWS_BUCKET_NAME, "Key": output_csv_key},
+            ExpiresIn=900,
+        )
 
     return {
         "request_id": request_id,
         "status": status,
         "processed_rows": processed_rows,
         "total_rows": total_rows,
-        "progress": f"{(processed_rows / total_rows) * 100:.2f}%",
-        "csv_url": csv_url if status == "csv_ready" else None
+        "progress": f"{progress:.2f}%",
+        "csv_url": csv_url,
     }
 
 @app.get("/download/{request_id}")
 def download_csv(request_id: str):
-    """Fetch the CSV file from S3 and return it as a streaming response."""
-    
-    csv_url = redis_client.get(f"request:{request_id}:csv_url")
+    """Fetch the completed output CSV from S3."""
+    status = redis_client.get(f"request:{request_id}:status")
+    if status is None:
+        raise HTTPException(status_code=404, detail="Request not found.")
+    if status != "csv_ready":
+        raise HTTPException(
+            status_code=409,
+            detail="CSV processing is not complete.",
+        )
 
-    if not csv_url:
-        return {"error": "CSV file not found or processing not completed yet."}
+    output_csv_key = redis_client.get(f"request:{request_id}:output_csv_key")
+    if not output_csv_key:
+        raise HTTPException(status_code=404, detail="Output CSV not found.")
 
-    # Fetch the CSV file from S3
-    response = requests.get(csv_url, stream=True)
-    
-    if response.status_code != 200:
-        return {"error": "Failed to fetch CSV file from S3."}
+    try:
+        response = s3_client.get_object(
+            Bucket=AWS_BUCKET_NAME,
+            Key=output_csv_key,
+        )
+    except (botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to fetch CSV file from S3.",
+        ) from exc
 
-    return StreamingResponse(response.iter_content(chunk_size=1024), 
-                             media_type="text/csv",
-                             headers={"Content-Disposition": f"attachment; filename={request_id}.csv"})
+    return StreamingResponse(
+        response["Body"].iter_chunks(chunk_size=1024),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={request_id}.csv"},
+    )
