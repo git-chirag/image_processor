@@ -1,3 +1,4 @@
+import logging
 import uuid
 
 import botocore.exceptions
@@ -6,8 +7,11 @@ from fastapi.responses import StreamingResponse
 
 from app.tasks import process_csv
 from app.config import redis_client, s3_client, AWS_BUCKET_NAME
+from app.redis_state import set_request_value
 from app.validation import validate_csv
 
+
+logger = logging.getLogger(__name__)
 app = FastAPI()
 
 @app.post("/upload-csv/")
@@ -41,13 +45,14 @@ async def upload_csv(file: UploadFile = File(...), webhook_url: str = Form(None)
             detail="Unable to store the CSV for processing.",
         ) from exc
 
-    redis_client.set(f"request:{request_id}:status", "processing")
-    redis_client.set(f"request:{request_id}:input_csv_key", input_csv_key)
+    set_request_value(request_id, "status", "processing")
+    set_request_value(request_id, "input_csv_key", input_csv_key)
     if webhook_url:
-        redis_client.set(f"request:{request_id}:webhook_url", webhook_url)
-        redis_client.set(f"request:{request_id}:webhook_status", "pending")
+        set_request_value(request_id, "webhook_url", webhook_url)
+        set_request_value(request_id, "webhook_status", "pending")
 
     process_csv.delay(request_id)
+    logger.info("Accepted CSV request_id=%s", request_id)
 
     return {"request_id": request_id, "status": "processing"}
 

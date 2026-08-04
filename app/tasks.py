@@ -1,10 +1,23 @@
 import io
+import logging
+
 import botocore.exceptions
 from celery import Task, chain, chord, group
 import requests
 from app.celery_worker import celery
-from app.config import s3_client, AWS_BUCKET_NAME, AWS_REGION, redis_client, CLOUDINARY_FETCH_URL
+from app.config import (
+    s3_client,
+    AWS_BUCKET_NAME,
+    AWS_REGION,
+    redis_client,
+    CLOUDINARY_FETCH_URL,
+    REQUEST_TTL_SECONDS,
+)
+from app.redis_state import expire_request_key, set_request_value
 import csv
+
+
+logger = logging.getLogger(__name__)
 
 
 #TODO: find an alterantive for headers
@@ -15,8 +28,8 @@ headers = {
 
 MARK_REQUEST_FAILED_SCRIPT = redis_client.register_script("""
     local status = redis.call("GET", KEYS[1])
-    if status ~= "csv_ready" then
-        redis.call("SET", KEYS[1], "failed")
+    if status and status ~= "csv_ready" then
+        redis.call("SET", KEYS[1], "failed", "EX", ARGV[1])
         return 1
     end
     return 0
@@ -34,13 +47,21 @@ class RequestTask(Task):
             request_id = args[self.request_id_arg_index]
             try:
                 MARK_REQUEST_FAILED_SCRIPT(
-                    keys=[f"request:{request_id}:status"]
+                    keys=[f"request:{request_id}:status"],
+                    args=[REQUEST_TTL_SECONDS],
                 )
             except Exception as status_error:
-                print(
-                    f"Could not record failure for task {task_id}: "
-                    f"{status_error}"
+                logger.exception(
+                    "Could not record task failure task_id=%s error=%s",
+                    task_id,
+                    status_error,
                 )
+        logger.error(
+            "Task failed task=%s task_id=%s error=%s",
+            self.name,
+            task_id,
+            exc,
+        )
         super().on_failure(exc, task_id, args, kwargs, einfo)
 
 
@@ -60,15 +81,22 @@ class WebhookTask(Task):
         if args:
             request_id = args[0]
             try:
-                redis_client.set(
-                    f"request:{request_id}:webhook_status",
+                set_request_value(
+                    request_id,
+                    "webhook_status",
                     "failed",
                 )
             except Exception as status_error:
-                print(
-                    f"Could not record webhook failure for task {task_id}: "
-                    f"{status_error}"
+                logger.exception(
+                    "Could not record webhook failure task_id=%s error=%s",
+                    task_id,
+                    status_error,
                 )
+        logger.error(
+            "Webhook failed task_id=%s error=%s",
+            task_id,
+            exc,
+        )
         super().on_failure(exc, task_id, args, kwargs, einfo)
 
 
@@ -76,6 +104,9 @@ class WebhookTask(Task):
 MARK_IMAGE_COMPLETE_SCRIPT = redis_client.register_script("""
     local image_was_new = redis.call("SETNX", KEYS[1], "true")
     if image_was_new == 0 then
+        for index = 1, 4 do
+            redis.call("EXPIRE", KEYS[index], ARGV[1])
+        end
         return tonumber(redis.call("HGET", KEYS[4], "processed_image_count") or "0")
     end
 
@@ -89,6 +120,9 @@ MARK_IMAGE_COMPLETE_SCRIPT = redis_client.register_script("""
         end
     end
 
+    for index = 1, 4 do
+        redis.call("EXPIRE", KEYS[index], ARGV[1])
+    end
     return processed_images
 """)
 
@@ -102,7 +136,8 @@ def mark_image_complete(request_id, row_number, image_index):
             f"{row_key}:processed",
             f"request:{request_id}:processed_rows",
             row_key,
-        ]
+        ],
+        args=[REQUEST_TTL_SECONDS],
     )
 
 
@@ -133,9 +168,10 @@ def process_csv(request_id):
     data_rows = csv_data[1:]
 
     total_rows = len(data_rows)
-    redis_client.set(f"request:{request_id}:total_rows", total_rows)
-    redis_client.set(
-        f"request:{request_id}:processed_rows",
+    set_request_value(request_id, "total_rows", total_rows)
+    set_request_value(
+        request_id,
+        "processed_rows",
         0,
         nx=True,
     )
@@ -152,6 +188,7 @@ def process_csv(request_id):
             "product_name": product_name,
             "image_count": image_count
         })
+        expire_request_key(f"request:{request_id}:row:{row_number}")
 
         for index, url in enumerate(image_urls):
             redis_client.hset(f"request:{request_id}:row:{row_number}", f"image_{index}", url)
@@ -165,6 +202,11 @@ def process_csv(request_id):
     # Fan out image work and finalize only after every task succeeds.
     chord(group(image_tasks))(
         on_all_images_complete.s(request_id)
+    )
+    logger.info(
+        "Scheduled image workflow request_id=%s images=%s",
+        request_id,
+        len(image_tasks),
     )
 
 def get_compressed_url(image_url):
@@ -223,8 +265,9 @@ def generate_output_csv(request_id):
         ContentType="text/csv",
     )
 
-    redis_client.set(f"request:{request_id}:output_csv_key", s3_filename)
-    redis_client.set(f"request:{request_id}:status", "csv_ready")
+    set_request_value(request_id, "output_csv_key", s3_filename)
+    set_request_value(request_id, "status", "csv_ready")
+    logger.info("Generated output CSV request_id=%s", request_id)
     return request_id
 
 
@@ -270,7 +313,8 @@ def send_webhook_notification(request_id, total_rows):
         timeout=10,
     )
     response.raise_for_status()
-    redis_client.set(f"request:{request_id}:webhook_status", "delivered")
+    set_request_value(request_id, "webhook_status", "delivered")
+    logger.info("Delivered webhook request_id=%s", request_id)
     return {"status": "delivered"}
 
 @celery.task(
@@ -310,5 +354,6 @@ def compress_image(request_id, row_number, image_url, image_index):
     )
 
     redis_client.hset(f"request:{request_id}:row:{row_number}", f"processed_image_{image_index}", compressed_url)
+    expire_request_key(f"request:{request_id}:row:{row_number}")
     mark_image_complete(request_id, row_number, image_index)
     return {"compressed_url": compressed_url}
