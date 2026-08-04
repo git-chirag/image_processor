@@ -1,6 +1,6 @@
 import io
 import botocore.exceptions
-from celery import chain
+from celery import chain, chord, group
 import requests
 from app.celery_worker import celery
 from app.config import s3_client, AWS_BUCKET_NAME, AWS_REGION, redis_client, CLOUDINARY_FETCH_URL
@@ -12,6 +12,40 @@ import time
 headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
 }
+
+
+# Atomically count each completed image and row once, including after retries.
+MARK_IMAGE_COMPLETE_SCRIPT = redis_client.register_script("""
+    local image_was_new = redis.call("SETNX", KEYS[1], "true")
+    if image_was_new == 0 then
+        return tonumber(redis.call("HGET", KEYS[4], "processed_image_count") or "0")
+    end
+
+    local processed_images = redis.call("HINCRBY", KEYS[4], "processed_image_count", 1)
+    local total_images = tonumber(redis.call("HGET", KEYS[4], "image_count") or "0")
+
+    if processed_images == total_images then
+        local row_was_new = redis.call("SETNX", KEYS[2], "true")
+        if row_was_new == 1 then
+            redis.call("INCR", KEYS[3])
+        end
+    end
+
+    return processed_images
+""")
+
+
+def mark_image_complete(request_id, row_number, image_index):
+    """Atomically update image, row, and request progress in Redis."""
+    row_key = f"request:{request_id}:row:{row_number}"
+    MARK_IMAGE_COMPLETE_SCRIPT(
+        keys=[
+            f"{row_key}:image:{image_index}:processed",
+            f"{row_key}:processed",
+            f"request:{request_id}:processed_rows",
+            row_key,
+        ]
+    )
 
 
 @celery.task(name="process_csv")
@@ -33,6 +67,8 @@ def process_csv(request_id):
 
         total_rows = len(data_rows)
         redis_client.set(f"request:{request_id}:total_rows", total_rows)
+        redis_client.set(f"request:{request_id}:processed_rows", 0)
+        image_tasks = []
 
         for row_number, row in enumerate(data_rows, start=1):
             sr_no = row[0].strip()
@@ -46,11 +82,20 @@ def process_csv(request_id):
                 "image_count": image_count 
             })
 
-            #redis_client.rpush(f"request:{request_id}:row:{row_number}:image_urls", *image_urls)#store input-urls as list for each row
-
             for index, url in enumerate(image_urls):
                 redis_client.hset(f"request:{request_id}:row:{row_number}", f"image_{index}", url)
-                compress_image.delay(request_id, row_number, url, index)  # Process images asynchronously
+                image_tasks.append(
+                    compress_image.s(request_id, row_number, url, index)
+                )
+
+        if not image_tasks:
+            redis_client.set(f"request:{request_id}:status", "failed")
+            return {"error": "No image tasks were created"}
+
+        # Fan out image work and finalize only after every task succeeds.
+        chord(group(image_tasks))(
+            on_all_images_complete.s(request_id)
+        )
 
     except Exception as e:
         redis_client.set(f"request:{request_id}:status", "failed")
@@ -111,6 +156,24 @@ def generate_output_csv(request_id):
         print(f"Error uploading CSV to S3: {e}")
         redis_client.set(f"request:{request_id}:status", "csv_upload_failed")  # New status for failed upload
         return {"error": "Failed to upload CSV"}
+
+
+@celery.task(name="on_all_images_complete")
+def on_all_images_complete(results, request_id):
+    """Start finalization after the chord confirms all image tasks succeeded."""
+    total_rows = int(redis_client.get(f"request:{request_id}:total_rows") or 0)
+    redis_client.set(f"request:{request_id}:status", "completed")
+
+    # Preserve finalization order while keeping each step as a Celery task.
+    chain(
+        generate_output_csv.s(request_id),
+        send_webhook_notification.s(total_rows),
+    ).apply_async()
+
+    return {
+        "request_id": request_id,
+        "processed_images": len(results),
+    }
     
 @celery.task(name="send_webhook_notification")
 def send_webhook_notification(request_id, total_rows):
@@ -128,35 +191,6 @@ def send_webhook_notification(request_id, total_rows):
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
             print(f"Webhook request failed for {webhook_url}: {e}")
-
-@celery.task(name="check_csv_completion", max_retries=5, default_retry_delay=10)
-def check_csv_completion(request_id, row_number):
-    """Check if all images and rows are processed, then trigger CSV generation and webhook notification."""
-    
-    # Get total images in the row
-    total_images = int(redis_client.hget(f"request:{request_id}:row:{row_number}", "image_count") or 0)
-    
-    # Count how many images have been processed
-    processed_images = int(redis_client.hget(f"request:{request_id}:row:{row_number}", "processed_image_count") or 0)
-
-    if processed_images == total_images:
-        row_processed_key = f"request:{request_id}:row:{row_number}:processed"
-        if not redis_client.exists(row_processed_key):
-            redis_client.incr(f"request:{request_id}:processed_rows")
-            redis_client.set(row_processed_key, "true")  # Mark this row as processed
-    
-    total_rows = int(redis_client.get(f"request:{request_id}:total_rows") or 0)
-    processed_rows = int(redis_client.get(f"request:{request_id}:processed_rows") or 0)
-
-    if processed_rows == total_rows:
-        redis_client.set(f"request:{request_id}:status", "completed")  # Mark CSV as completed
-
-        try:
-            chain(generate_output_csv.s(request_id), send_webhook_notification.s(total_rows)).apply_async()
-        except check_csv_completion.max_retries:  
-            redis_client.set(f"request:{request_id}:status", "failed")
-            print(f"CSV processing failed after max retries for request {request_id}")
-
 
 @celery.task(name="compress_image", autoretry_for=(requests.exceptions.RequestException, IOError, botocore.exceptions.ClientError),
              retry_kwargs={"max_retries": 3, "countdown": 5}, retry_backoff=True)
@@ -185,10 +219,6 @@ def compress_image(request_id, row_number, image_url, image_index):
 
     
 
-    # Store the processed image URL in Redis
-    # redis_client.rpush(f"request:{request_id}:row:{row_number}:processed_urls", compressed_url)
     redis_client.hset(f"request:{request_id}:row:{row_number}", f"processed_image_{image_index}", compressed_url)
-    redis_client.hincrby(f"request:{request_id}:row:{row_number}", "processed_image_count", 1)
-
-    check_csv_completion.apply_async((request_id, row_number))
+    mark_image_complete(request_id, row_number, image_index)
     return {"compressed_url": compressed_url}
