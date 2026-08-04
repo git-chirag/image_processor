@@ -1,76 +1,26 @@
-from fastapi import FastAPI, BackgroundTasks, Form, UploadFile, File, HTTPException
-import csv, io, uuid
+from fastapi import FastAPI, Form, UploadFile, File, HTTPException
+import uuid
 from fastapi.responses import StreamingResponse
 from app.tasks import process_csv
 from app.config import redis_client, s3_client, AWS_BUCKET_NAME
-import re
+from app.validation import validate_csv
 import requests
-
-MAX_ROWS = 1000  # Maximum number of rows allowed in CSV
-MAX_IMAGES_PER_ROW = 10  # Maximum number of image URLs allowed per row
-
-def validate_csv(file_content: str):
-    """Validates CSV content before processing. Raises HTTPException on failure."""
-    csv_data = list(csv.reader(file_content.splitlines()))
-    
-    # Check if file is empty
-    if not csv_data or len(csv_data) < 2:
-        raise HTTPException(status_code=400, detail="CSV file is empty or missing data.")
-
-    # Validate header
-    expected_headers = ["Sr. No", "Product Name", "Input Image URLs"]
-    csv_headers = [header.strip() for header in csv_data[0][:3]]
-    if not all(header in csv_headers for header in expected_headers):
-        raise HTTPException(status_code=400, detail="Invalid CSV headers. Expected: 'Sr. No', 'Product Name', and 'Input Image URLs'.")
-    
-    total_rows = len(csv_data) - 1  # Exclude header row
-    if total_rows > MAX_ROWS:
-        raise HTTPException(status_code=400, detail=f"CSV exceeds maximum allowed rows ({MAX_ROWS}).")
-
-    sr_no_set = set()
-    
-    for row_number, row in enumerate(csv_data[1:], start=1):  # Skip header
-        if len(row) < 3:
-            raise HTTPException(status_code=400, detail=f"Row {row_number}: Missing image URLs.")
-
-        sr_no = row[0].strip()
-        product_name = row[1].strip()
-        image_urls = [url.strip() for url in row[2:] if url]
-
-        # Validate Serial Number
-        if not re.match(r"^[a-zA-Z0-9_-]+$", sr_no):
-            raise HTTPException(status_code=400, detail=f"Row {row_number}: Invalid serial number format.")
-
-        if sr_no in sr_no_set:
-            raise HTTPException(status_code=400, detail=f"Row {row_number}: Duplicate serial number '{sr_no}' found.")
-        sr_no_set.add(sr_no)
-
-        # Validate Product Name
-        if not re.match(r"^[a-zA-Z0-9\s_-]+$", product_name):
-            raise HTTPException(status_code=400, detail=f"Row {row_number}: Invalid product name format.")
-
-        # Validate Image URLs
-        if not image_urls:
-            raise HTTPException(status_code=400, detail=f"Row {row_number}: At least one image URL is required.")
-
-        if len(image_urls) > MAX_IMAGES_PER_ROW:
-            raise HTTPException(status_code=400, detail=f"Row {row_number}: Exceeds max {MAX_IMAGES_PER_ROW} images per row.")
-
-        for url in image_urls:
-            if not re.match(r"^https?://.*\.(jpg|jpeg|png)$", url, re.IGNORECASE):
-                raise HTTPException(status_code=400, detail=f"Row {row_number}: Invalid image URL format '{url}'.")
-
-    return True
 
 app = FastAPI()
 
 @app.post("/upload-csv/")
 async def upload_csv(file: UploadFile = File(...), webhook_url: str = Form(None)):
-    content = await file.read() 
+    content = await file.read()
     try:
-        validate_csv(content.decode("utf-8"))
-    except HTTPException as e:
-        return {"Validation Error": e.detail} 
+        decoded_content = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="CSV must be UTF-8 encoded.",
+        ) from exc
+
+    # Validation errors propagate so FastAPI returns the intended HTTP 400.
+    validate_csv(decoded_content)
 
     print("outside validate_csv")
     request_id = str(uuid.uuid4()) #create a unique id for the request
@@ -127,4 +77,3 @@ def download_csv(request_id: str):
     return StreamingResponse(response.iter_content(chunk_size=1024), 
                              media_type="text/csv",
                              headers={"Content-Disposition": f"attachment; filename={request_id}.csv"})
-   
