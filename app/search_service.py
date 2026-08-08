@@ -17,12 +17,36 @@ class ImageSearchService:
         encoder = self.encoder or get_clip_encoder()
         vector_store = self.vector_store or get_image_vector_store()
         query_vector = encoder.encode_text(normalized_query)
-        points = vector_store.search(
+        return self._search_vector_store(
+            vector_store=vector_store,
             query_vector=query_vector,
             limit=limit,
             score_threshold=score_threshold,
         )
 
+    def search_by_image(self, image_content, limit=10, score_threshold=None):
+        encoder = self.encoder or get_clip_encoder()
+        vector_store = self.vector_store or get_image_vector_store()
+        query_vector = encoder.encode_image(image_content)
+        return self._search_vector_store(
+            vector_store=vector_store,
+            query_vector=query_vector,
+            limit=limit,
+            score_threshold=score_threshold,
+        )
+
+    def _search_vector_store(
+        self,
+        vector_store,
+        query_vector,
+        limit,
+        score_threshold,
+    ):
+        points = vector_store.search(
+            query_vector=query_vector,
+            limit=limit,
+            score_threshold=score_threshold,
+        )
         return [self._format_result(point) for point in points]
 
     @staticmethod

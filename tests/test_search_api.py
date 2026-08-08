@@ -1,7 +1,9 @@
 import unittest
+from io import BytesIO
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from app.search_api import router
 from app.search_service import get_image_search_service
@@ -14,6 +16,12 @@ class FakeSearchService:
         self.arguments = None
 
     def search(self, **kwargs):
+        self.arguments = kwargs
+        if self.error:
+            raise self.error
+        return self.results
+
+    def search_by_image(self, **kwargs):
         self.arguments = kwargs
         if self.error:
             raise self.error
@@ -82,6 +90,47 @@ class ImageSearchApiTests(unittest.TestCase):
             response.json()["detail"],
             "Image search is temporarily unavailable.",
         )
+
+    def test_visual_search_accepts_an_image_upload(self):
+        service = FakeSearchService()
+        self.app.dependency_overrides[get_image_search_service] = lambda: service
+
+        with TestClient(self.app) as client:
+            response = client.post(
+                "/api/v1/images/search-by-image",
+                params={"limit": 4, "score_threshold": 0.75},
+                files={"file": ("query.png", _png_bytes(), "image/png")},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"filename": "query.png", "results": []})
+        self.assertEqual(service.arguments["limit"], 4)
+        self.assertEqual(service.arguments["score_threshold"], 0.75)
+        self.assertTrue(service.arguments["image_content"])
+
+    def test_visual_search_rejects_unsupported_content_type(self):
+        with TestClient(self.app) as client:
+            response = client.post(
+                "/api/v1/images/search-by-image",
+                files={"file": ("query.gif", b"GIF89a", "image/gif")},
+            )
+
+        self.assertEqual(response.status_code, 415)
+
+    def test_visual_search_rejects_invalid_image_content(self):
+        with TestClient(self.app) as client:
+            response = client.post(
+                "/api/v1/images/search-by-image",
+                files={"file": ("query.png", b"not an image", "image/png")},
+            )
+
+        self.assertEqual(response.status_code, 400)
+
+
+def _png_bytes():
+    output = BytesIO()
+    Image.new("RGB", (8, 8), "gold").save(output, format="PNG")
+    return output.getvalue()
 
 
 if __name__ == "__main__":

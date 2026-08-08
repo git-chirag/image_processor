@@ -17,3 +17,8 @@ class ImageSearchResult(BaseModel):
 class ImageSearchResponse(BaseModel):
     query: str
     results: List[ImageSearchResult]
+
+
+class VisualSearchResponse(BaseModel):
+    filename: str
+    results: List[ImageSearchResult]
