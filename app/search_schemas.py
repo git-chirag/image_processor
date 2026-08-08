@@ -22,3 +22,10 @@ class ImageSearchResponse(BaseModel):
 class VisualSearchResponse(BaseModel):
     filename: str
     results: List[ImageSearchResult]
+
+
+class NearDuplicateResponse(BaseModel):
+    filename: str
+    is_duplicate: bool
+    threshold: float
+    matches: List[ImageSearchResult]

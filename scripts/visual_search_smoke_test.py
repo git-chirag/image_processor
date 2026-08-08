@@ -53,6 +53,11 @@ def main():
             params={"limit": 3},
             files={"file": ("shifted-red-circle.png", query_image, "image/png")},
         )
+        duplicate_response = client.post(
+            "/api/v1/images/detect-duplicates",
+            params={"threshold": 0.95},
+            files={"file": ("shifted-red-circle.png", query_image, "image/png")},
+        )
 
     response.raise_for_status()
     results = response.json()["results"]
@@ -66,6 +71,15 @@ def main():
         raise RuntimeError("Expected the red circle to be the closest image.")
 
     print("Visual search passed: the modified red circle ranked first.")
+
+    duplicate_response.raise_for_status()
+    duplicate_result = duplicate_response.json()
+    if not duplicate_result["is_duplicate"]:
+        raise RuntimeError("Expected the modified red circle to be a duplicate.")
+    print(
+        "Duplicate detection passed: "
+        f"{len(duplicate_result['matches'])} match(es) exceeded 0.95."
+    )
     qdrant_client.close()
 
 

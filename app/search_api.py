@@ -5,7 +5,11 @@ from typing import Optional
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from PIL import Image, UnidentifiedImageError
 
-from app.search_schemas import ImageSearchResponse, VisualSearchResponse
+from app.search_schemas import (
+    ImageSearchResponse,
+    NearDuplicateResponse,
+    VisualSearchResponse,
+)
 from app.search_service import ImageSearchService, get_image_search_service
 
 
@@ -51,22 +55,7 @@ def search_by_image(
     score_threshold: Optional[float] = Query(None, ge=-1.0, le=1.0),
     service: ImageSearchService = Depends(get_image_search_service),
 ):
-    if file.content_type not in ALLOWED_IMAGE_CONTENT_TYPES:
-        raise HTTPException(
-            status_code=415,
-            detail="Only JPEG, PNG, and WebP images are supported.",
-        )
-
-    image_content = file.file.read(MAX_SEARCH_IMAGE_BYTES + 1)
-    if not image_content:
-        raise HTTPException(status_code=400, detail="Uploaded image is empty.")
-    if len(image_content) > MAX_SEARCH_IMAGE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail="Uploaded image must not exceed 10 MB.",
-        )
-
-    _validate_search_image(image_content)
+    image_content = _read_search_image(file)
 
     try:
         results = service.search_by_image(
@@ -85,6 +74,59 @@ def search_by_image(
         filename=file.filename or "uploaded-image",
         results=results,
     )
+
+
+@router.post("/detect-duplicates", response_model=NearDuplicateResponse)
+def detect_near_duplicates(
+    file: UploadFile = File(...),
+    limit: int = Query(10, ge=1, le=50),
+    threshold: float = Query(0.95, ge=0.8, le=1.0),
+    service: ImageSearchService = Depends(get_image_search_service),
+):
+    image_content = _read_search_image(file)
+
+    try:
+        matches = service.find_near_duplicates(
+            image_content=image_content,
+            limit=limit,
+            threshold=threshold,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Near-duplicate detection failed filename=%r",
+            file.filename,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Duplicate detection is temporarily unavailable.",
+        ) from exc
+
+    return NearDuplicateResponse(
+        filename=file.filename or "uploaded-image",
+        is_duplicate=bool(matches),
+        threshold=threshold,
+        matches=matches,
+    )
+
+
+def _read_search_image(file):
+    if file.content_type not in ALLOWED_IMAGE_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail="Only JPEG, PNG, and WebP images are supported.",
+        )
+
+    image_content = file.file.read(MAX_SEARCH_IMAGE_BYTES + 1)
+    if not image_content:
+        raise HTTPException(status_code=400, detail="Uploaded image is empty.")
+    if len(image_content) > MAX_SEARCH_IMAGE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="Uploaded image must not exceed 10 MB.",
+        )
+
+    _validate_search_image(image_content)
+    return image_content
 
 
 def _validate_search_image(image_content):

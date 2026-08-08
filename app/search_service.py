@@ -35,6 +35,18 @@ class ImageSearchService:
             score_threshold=score_threshold,
         )
 
+    def find_near_duplicates(
+        self,
+        image_content,
+        limit=10,
+        threshold=0.95,
+    ):
+        return self.search_by_image(
+            image_content=image_content,
+            limit=limit,
+            score_threshold=threshold,
+        )
+
     def _search_vector_store(
         self,
         vector_store,

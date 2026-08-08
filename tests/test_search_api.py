@@ -27,6 +27,12 @@ class FakeSearchService:
             raise self.error
         return self.results
 
+    def find_near_duplicates(self, **kwargs):
+        self.arguments = kwargs
+        if self.error:
+            raise self.error
+        return self.results
+
 
 class ImageSearchApiTests(unittest.TestCase):
     def setUp(self):
@@ -125,6 +131,56 @@ class ImageSearchApiTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 400)
+
+    def test_duplicate_detection_returns_matches_above_threshold(self):
+        service = FakeSearchService(results=[{
+            "point_id": "point-1",
+            "score": 0.98,
+            "request_id": "request-1",
+            "row_number": 2,
+            "image_index": 3,
+            "product_name": "Duplicate image",
+            "original_url": "https://source.example/image.jpg",
+            "compressed_url": "https://bucket.example/image.jpg",
+        }])
+        self.app.dependency_overrides[get_image_search_service] = lambda: service
+
+        with TestClient(self.app) as client:
+            response = client.post(
+                "/api/v1/images/detect-duplicates",
+                params={"threshold": 0.97, "limit": 5},
+                files={"file": ("query.png", _png_bytes(), "image/png")},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["is_duplicate"])
+        self.assertEqual(response.json()["threshold"], 0.97)
+        self.assertEqual(response.json()["matches"][0]["point_id"], "point-1")
+        self.assertEqual(service.arguments["threshold"], 0.97)
+
+    def test_duplicate_detection_returns_false_without_matches(self):
+        service = FakeSearchService()
+        self.app.dependency_overrides[get_image_search_service] = lambda: service
+
+        with TestClient(self.app) as client:
+            response = client.post(
+                "/api/v1/images/detect-duplicates",
+                files={"file": ("query.png", _png_bytes(), "image/png")},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["is_duplicate"])
+        self.assertEqual(response.json()["matches"], [])
+
+    def test_duplicate_threshold_below_safe_range_is_rejected(self):
+        with TestClient(self.app) as client:
+            response = client.post(
+                "/api/v1/images/detect-duplicates",
+                params={"threshold": 0.5},
+                files={"file": ("query.png", _png_bytes(), "image/png")},
+            )
+
+        self.assertEqual(response.status_code, 422)
 
 
 def _png_bytes():

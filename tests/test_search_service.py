@@ -105,6 +105,20 @@ class ImageSearchServiceTests(unittest.TestCase):
             CLIP_VECTOR_SIZE,
         )
 
+    def test_near_duplicate_search_applies_strict_threshold(self):
+        encoder = FakeEncoder()
+        vector_store = FakeVectorStore([])
+        service = ImageSearchService(encoder, vector_store)
+
+        service.find_near_duplicates(
+            image_content=b"image bytes",
+            limit=4,
+            threshold=0.97,
+        )
+
+        self.assertEqual(vector_store.search_arguments["limit"], 4)
+        self.assertEqual(vector_store.search_arguments["score_threshold"], 0.97)
+
 
 if __name__ == "__main__":
     unittest.main()
