@@ -3,6 +3,10 @@ import logging
 
 import botocore.exceptions
 from celery import Task, chain, chord, group
+from qdrant_client.http.exceptions import (
+    ResponseHandlingException,
+    UnexpectedResponse,
+)
 import requests
 from app.celery_worker import celery
 from app.config import (
@@ -13,6 +17,7 @@ from app.config import (
     CLOUDINARY_FETCH_URL,
     REQUEST_TTL_SECONDS,
 )
+from app.image_indexer import index_processed_image
 from app.redis_state import expire_request_key, set_request_value
 import csv
 
@@ -324,6 +329,8 @@ def send_webhook_notification(request_id, total_rows):
         requests.exceptions.RequestException,
         botocore.exceptions.BotoCoreError,
         botocore.exceptions.ClientError,
+        ResponseHandlingException,
+        UnexpectedResponse,
         OSError,
     ),
     retry_kwargs={"max_retries": 3},
@@ -353,7 +360,29 @@ def compress_image(request_id, row_number, image_url, image_index):
         f"{s3_filename}"
     )
 
-    redis_client.hset(f"request:{request_id}:row:{row_number}", f"processed_image_{image_index}", compressed_url)
-    expire_request_key(f"request:{request_id}:row:{row_number}")
+    row_key = f"request:{request_id}:row:{row_number}"
+    point_id = index_processed_image(
+        request_id=request_id,
+        row_number=row_number,
+        image_index=image_index,
+        image_url=image_url,
+        compressed_url=compressed_url,
+        image_content=response.content,
+        product_name=redis_client.hget(row_key, "product_name") or "",
+    )
+
+    redis_client.hset(
+        row_key,
+        f"processed_image_{image_index}",
+        compressed_url,
+    )
+    expire_request_key(row_key)
     mark_image_complete(request_id, row_number, image_index)
+    logger.info(
+        "Indexed processed image request_id=%s row=%s image=%s point_id=%s",
+        request_id,
+        row_number,
+        image_index,
+        point_id,
+    )
     return {"compressed_url": compressed_url}
