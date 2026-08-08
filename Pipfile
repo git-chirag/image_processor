@@ -13,6 +13,9 @@ pillow = "*"
 python-dotenv = "*"
 requests = "*"
 python-multipart = "*"
+qdrant-client = "==1.16.1"
+torch = "==2.6.0"
+transformers = "==4.49.0"
 
 [dev-packages]
 

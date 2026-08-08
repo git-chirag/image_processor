@@ -4,3 +4,5 @@ __pycache__/
 *.pyo
 app/commands.txt
 app/commands.txt
+to_learn.txt
+data/qdrant/
