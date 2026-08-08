@@ -8,11 +8,13 @@ from fastapi.responses import StreamingResponse
 from app.tasks import process_csv
 from app.config import redis_client, s3_client, AWS_BUCKET_NAME
 from app.redis_state import set_request_value
+from app.search_api import router as image_search_router
 from app.validation import validate_csv
 
 
 logger = logging.getLogger(__name__)
 app = FastAPI()
+app.include_router(image_search_router)
 
 @app.post("/upload-csv/")
 async def upload_csv(file: UploadFile = File(...), webhook_url: str = Form(None)):
